@@ -1,6 +1,4 @@
 <?php
-declare(ticks = 1);
-
 /**
  * Resque worker that handles checking queues for jobs, fetching them
  * off the queues, running them and handling the result.
@@ -19,37 +17,42 @@ class Resque_Worker
 	/**
 	 * @var array Array of all associated queues for this worker.
 	 */
-	protected $queues = array();
+	private $queues = array();
 
 	/**
 	 * @var string The hostname of this worker.
 	 */
-	protected $hostname;
+	private $hostname;
 
 	/**
 	 * @var boolean True if on the next iteration, the worker should shutdown.
 	 */
-	protected $shutdown = false;
+	private $shutdown = false;
 
 	/**
 	 * @var boolean True if this worker is paused.
 	 */
-	protected $paused = false;
+	private $paused = false;
 
 	/**
 	 * @var string String identifying this worker.
 	 */
-	protected $id;
+	private $id;
 
 	/**
 	 * @var Resque_Job Current job, if any, being processed by this worker.
 	 */
-	protected $currentJob = null;
+	private $currentJob = null;
 
 	/**
 	 * @var int Process ID of child worker processes.
 	 */
-	protected $child = null;
+	private $child = null;
+
+	/**
+	 * @var \Predis\Client[]
+	 */
+	private $sourceServersClients = null;
 
     /**
      * Instantiate a new worker, given a list of queues that it should be working
@@ -65,14 +68,19 @@ class Resque_Worker
     public function __construct($queues)
     {
         $this->logger = new Resque_Log();
-
+        
         if(!is_array($queues)) {
             $queues = array($queues);
         }
 
         $this->queues = $queues;
-        $this->hostname = php_uname('n');
-
+        if(function_exists('gethostname')) {
+            $hostname = gethostname();
+        }
+        else {
+            $hostname = php_uname('n');
+        }
+        $this->hostname = $hostname;
         $this->id = $this->hostname . ':'.getmypid() . ':' . implode(',', $this->queues);
     }
 
@@ -133,6 +141,212 @@ class Resque_Worker
 	{
 		$this->id = $workerId;
 	}
+	
+	
+	/**
+	 * Connect to source servers
+	 */
+	public function connectToSourceServers()
+	{
+	    global $QUEUE;
+	    if (!$QUEUE) {
+	        $QUEUE = getenv('QUEUE');
+	    }
+	    if ($QUEUE != 'default') {
+	        return;
+	    }
+	    $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Connecting to nodes...');
+	    if (is_array(Resque::redis()->sourceServer)) {
+	        foreach (Resque::redis()->sourceServer as $server) {
+	            $client = new \Predis\Client($server);
+	            $client->connect();
+	            if ($client->isConnected()) {
+	                $this->sourceServersClients[] = $client;	                
+	            } else {
+	                die("Can't connect to server: " . $server);
+	            }
+	        }
+	    }
+	    $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Connected to nodes');
+	    usleep($interval * 1000000);
+	}
+	
+	/**
+	 * Look for data to source servers
+	 */
+	public function collectDataFromSourceServers()
+	{
+	    global $QUEUE;
+	    if (!$QUEUE) {
+	        $QUEUE = getenv('QUEUE');
+	    }
+        if ($QUEUE != 'default') {
+            return;
+        }
+
+        
+        $data = array();
+	    if (is_array($this->sourceServersClients)) {
+	        foreach ($this->sourceServersClients as $client) {
+	            if (!$client->isConnected()) {
+	                die("Disconnected from some node server");
+	            }
+	        }
+	        
+	        foreach ($this->sourceServersClients as $client) {
+	            if ($client->isConnected()) {
+    	            while($values = array_pop($client->lrange('resque:queue:node', 0, 0))) {
+    	                $jobJson = json_decode($values, true);
+    	                $key = floatval($jobJson['queue_time']);
+    	                $jobId = $jobJson['id'];
+    	                $jobDatetime = unserialize($jobJson['args'][0]['datetime']);
+    	                $datetime = $jobDatetime ? $jobDatetime : new \DateTime();
+    	                
+//     	                if (!\Resque::redis()->rpush('backup:' . $datetime->format("Y:m:d:H:i") . ':' . $jobJson['id'], 1)) {
+//     	                    die("Can't put job to resque. Return job no node!");
+//     	                } else 
+    	                if (!$jobId) {
+    	                    die("JobId is null");
+	                    } else if (!$jobJson['args'][0]) {
+	                        die("jobdata is null");
+    	                } else {
+    	                    $client->del(array('resque:job:' . $jobId . ':status'));
+    	                    $data[(string) $key . $jobId] = $jobJson;
+    	                    $jobdata = serialize($jobJson['args'][0]);
+    	                    $jobdata = gzencode($jobdata, 9);
+    	                    if ($jobdata) {
+    	                       $writen = file_put_contents(__DIR__ . '/../../../../../app/logs/jobs/' . 'backup.' . $datetime->format("Y.m.d.H.i") . '.' . $jobJson['id'], $jobdata);
+    	                       if ($writen) {
+    	                           $client->lpop('resque:queue:node'); // only if all ok remove job
+    	                           $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Job ' . $jobJson['id'] . ' put to file, pop from node');
+    	                       } else {
+    	                           $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' ERROR: job cant write to backup file, Job ' . $jobJson['id']);
+    	                           die("job can't write to backup file " . $jobJson['id']);
+    	                       }
+    	                    } else {
+    	                        $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' ERROR: jobdata serialized and gzip is null, Job ' . $jobJson['id']);
+        	                    die("jobdata serialized and gzip is null" . $jobJson['id']);
+    	                    }
+    	                }
+    	            }
+	            } else {
+	                die("Disconnected from some node server");
+	            }
+	        }
+	    }
+
+        if (count($data) && ksort($data)) {
+            $queues = array('default','thread0','thread1','thread2','thread3','thread4','thread5','thread6','thread7','thread8','thread9');
+             
+            $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Building queue list...');
+            foreach ($queues as $queue) {
+                if ($queue !== 'default') {
+                    $len = \Resque::redis()->lLen('resque:queue:' . $queue);
+                    $list = \Resque::redis()->lRange('resque:queue:' . $queue, 0, $len);
+                    foreach ($list as $elem) {
+                        $listElem[text] = $elem;
+                        $listElem[json] = json_decode($elem);
+                        $req = unserialize(base64_decode($listElem[json]->args[0]->request));
+                        $listElem[req] = $req;
+                        if ($req && method_exists($req, 'getSearchuid')) {
+                            $searchUidThread[$req->getSearchuid()] = $queue;
+                        }
+//                         $queueList[$queue][] = $listElem;
+                    }
+                    $sizes[$queue] = \Resque::size($queue);
+                }
+            }
+            $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Build queue list complete');
+            
+            $index = 0;
+	        foreach ($data as $item) {
+	            $start = microtime(true);
+	            $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Produce list: ' . (++$index) . ' of ' . count($data) . ', job: ' . $item['id']);
+
+	            $request = unserialize(base64_decode($item['args'][0][request]));
+	            
+	            $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' unserialized ' . (microtime(true)-$start));
+	            
+	            if ($request && method_exists($request, 'getSearchuid')) {
+	                $searchuid = $request->getSearchuid();
+	                
+//                     foreach ($queues as $queue) {
+//                         if ($queue !== 'default') {
+//                             if (is_array($queueList[$queue]) && count($queueList[$queue])) {
+//                                 foreach ($queueList[$queue] as $elem) {
+//                                     $req = $elem[req];
+//                                     if ($req) {
+//                                         try {
+//                                             $jobSearchuid = $req->getSearchuid();
+//                                             if ($jobSearchuid && $jobSearchuid == $searchuid) {
+//                                                 $foundInThread = $queue;
+//                                                 break;
+//                                             } else if (!$jobSearchuid) {
+//                                                 $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' ERROR: getSearchuid not found. '  . (microtime(true)-$start));
+//                                                 die();
+//                                             }
+//                                         } catch (\Exception $e) {
+//                                             $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' ERROR: getSearchuid not found. ' . $e->getMessage() . (microtime(true)-$start));
+//                                             die();
+//                                         }
+//                                     } else {
+//                                         $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' ERROR: req not found ' . (microtime(true)-$start));
+//                                         die();
+//                                     }
+//                                 }
+                                
+//                                 if ($foundInThread) {
+//                                     break;
+//                                 }
+//                             }
+//                         }
+//                     }
+                    
+                    $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' search in threads ' . (microtime(true)-$start));
+                    
+                    if ($searchUidThread[$searchuid]) {
+                        $thread = $searchUidThread[$searchuid];
+                    } else {
+                        $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Sorting...');
+                        asort($sizes);
+                        reset($sizes);
+                        $thread = key($sizes);
+                    }
+                    
+                    $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Make stdClass ' . (microtime(true)-$start));
+                    $o = new stdClass();
+                    $argsObj = new stdClass();                    
+                    foreach ($item['args'][0] as $key=>$value) {
+                        $argsObj->$key = $value;
+                    }
+                    $o->args[0] = $argsObj;
+                    $o->class = $item['class'];
+                    $o->id = $item['id'];
+                    $o->queue_time = $item['queue_time'];
+                    $listElem[text] = json_encode($o, JSON_UNESCAPED_UNICODE);
+                    $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' json_encode ' . (microtime(true)-$start));
+                    $listElem[json] = $o;
+                    $req = unserialize(base64_decode($o->args[0]->request));
+                    $listElem[req] = $req;
+                    if ($req && method_exists($req, 'getSearchuid')) {
+                        $searchUidThread[$req->getSearchuid()] = $thread;
+                        $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' suid ' . $req->getSearchuid() . ' to ' . $thread . ' ' . (microtime(true)-$start));
+                    }
+                    $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' unserialize & base64decode ' . (microtime(true)-$start));
+//                     $queueList[$thread][] = $listElem;
+                    $sizes[$thread]++;
+                    
+                    $newJobId = Resque::enqueue($thread, $item['class'], $item['args'][0], true);
+                    $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Put to ' . $thread . ' ' . $item['id'] . '->' . $newJobId . ' '  . (microtime(true)-$start));
+	            } else {
+	                $newJobId = Resque::enqueue('default', $item['class'], $item['args'][0], true);
+	                $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Put to default ' . $item['id'] . '->' . $newJobId . ' '  . (microtime(true)-$start));
+	            }
+	            
+	            $this->logger->log(Psr\Log\LogLevel::NOTICE, (new \DateTime())->format('Y-m-d H:i:s') . ' Ready ' . $index . ' of ' . count($data) . ' '  . (microtime(true)-$start));
+	        }
+	    }
+	}
 
 	/**
 	 * The primary loop for a worker which when called on an instance starts
@@ -144,12 +358,51 @@ class Resque_Worker
 	 */
 	public function work($interval = Resque::DEFAULT_INTERVAL, $blocking = false)
 	{
+	    global $QUEUE;
+	    if (!$QUEUE) {
+	        $QUEUE = getenv('QUEUE');
+	    }
+	    
+	    $this->connectToSourceServers();
 		$this->updateProcLine('Starting');
 		$this->startup();
 
 		while(true) {
 			if($this->shutdown) {
 				break;
+			}
+			
+			if ($QUEUE == 'default') {
+			    $collectorChild = Resque::fork();
+			    if ($collectorChild === 0 || $collectorChild === false || $collectorChild === -1) {
+			        $status = 'Collector since ' . strftime('%F %T');
+			        $this->updateProcLine($status);
+			        $this->logger->log(Psr\Log\LogLevel::INFO, $status);
+			        $this->collectDataFromSourceServers();
+			        if ($collectorChild === 0) {
+			            exit(0);
+			        }
+			    }
+			    
+			    if($collectorChild > 0 || $collectorChild === -1) {
+			        // Parent process, sit and wait
+			        $status = 'Forked default collector ' . $this->child . ' at ' . strftime('%F %T');
+			        $this->updateProcLine($status);
+			        $this->logger->log(Psr\Log\LogLevel::INFO, $status);
+			    
+			        // Wait until the child process finishes before continuing
+			        if($collectorChild > 0) {
+			            pcntl_wait($status);
+			            $exitStatus = pcntl_wexitstatus($status);
+			            if($exitStatus !== 0) {
+			            				$job->fail(new Resque_Job_DirtyExitException(
+			            				    'Job exited with exit code ' . $exitStatus
+			            				));
+			            }
+			        }
+			    }
+			    
+			    $collectorChild = null;			    
 			}
 
 			// Attempt to find and reserve a job
@@ -182,43 +435,46 @@ class Resque_Worker
 						$this->updateProcLine('Waiting for ' . implode(',', $this->queues));
 					}
 
-					usleep($interval * 1000000);
+					usleep($interval * 1000);
 				}
 
 				continue;
 			}
 
-			$this->logger->log(Psr\Log\LogLevel::NOTICE, 'Starting work on {job}', array('job' => $job));
+			$this->logger->log(Psr\Log\LogLevel::NOTICE, 'Starting work (/' . Resque::size($QUEUE) . ') on {job}', array('job' => $job));
 			Resque_Event::trigger('beforeFork', $job);
 			$this->workingOn($job);
 
-			$this->child = Resque::fork();
+ 			$this->child = Resque::fork();
+// 			$this->child = -1;
 
 			// Forked and we're the child. Run the job.
-			if ($this->child === 0 || $this->child === false) {
-				$status = 'Processing ' . $job->queue . ' since ' . strftime('%F %T');
-				$this->updateProcLine($status);
-				$this->logger->log(Psr\Log\LogLevel::INFO, $status);
-				$this->perform($job);
+			if ($this->child === 0 || $this->child === false || $this->child === -1) {
+    			$status = 'Processing ' . $job->queue . ' since ' . strftime('%F %T');
+    			$this->updateProcLine($status);
+    			$this->logger->log(Psr\Log\LogLevel::INFO, $status);
+    			$this->perform($job);
 				if ($this->child === 0) {
 					exit(0);
 				}
 			}
 
-			if($this->child > 0) {
+			if($this->child > 0 || $this->child === -1) {
 				// Parent process, sit and wait
-				$status = 'Forked ' . $this->child . ' at ' . strftime('%F %T');
-				$this->updateProcLine($status);
-				$this->logger->log(Psr\Log\LogLevel::INFO, $status);
-
-				// Wait until the child process finishes before continuing
-				pcntl_wait($status);
-				$exitStatus = pcntl_wexitstatus($status);
-				if($exitStatus !== 0) {
-					$job->fail(new Resque_Job_DirtyExitException(
-						'Job exited with exit code ' . $exitStatus
-					));
-				}
+    			$status = 'Forked ' . $this->child . ' at ' . strftime('%F %T');
+    			$this->updateProcLine($status);
+    			$this->logger->log(Psr\Log\LogLevel::INFO, $status);
+    
+    			// Wait until the child process finishes before continuing
+    			if($this->child > 0) {
+        			pcntl_wait($status);
+        			$exitStatus = pcntl_wexitstatus($status);
+        			if($exitStatus !== 0) {
+        				$job->fail(new Resque_Job_DirtyExitException(
+        					'Job exited with exit code ' . $exitStatus
+        				));
+    			    }
+    			}
 			}
 
 			$this->child = null;
@@ -240,7 +496,7 @@ class Resque_Worker
 			$job->perform();
 		}
 		catch(Exception $e) {
-			$this->logger->log(Psr\Log\LogLevel::CRITICAL, '{job} has failed {stack}', array('job' => $job, 'stack' => $e));
+			$this->logger->log(Psr\Log\LogLevel::CRITICAL, '{job} has failed {stack}', array('job' => $job, 'stack' => $e->getMessage()));
 			$job->fail($e);
 			return;
 		}
@@ -306,7 +562,7 @@ class Resque_Worker
 	/**
 	 * Perform necessary actions to start a worker.
 	 */
-	protected function startup()
+	private function startup()
 	{
 		$this->registerSigHandlers();
 		$this->pruneDeadWorkers();
@@ -321,10 +577,10 @@ class Resque_Worker
 	 *
 	 * @param string $status The updated process title.
 	 */
-	protected function updateProcLine($status)
+	private function updateProcLine($status)
 	{
 		$processTitle = 'resque-' . Resque::VERSION . ': ' . $status;
-		if(function_exists('cli_set_process_title') && PHP_OS !== 'Darwin') {
+		if(function_exists('cli_set_process_title')) {
 			cli_set_process_title($processTitle);
 		}
 		else if(function_exists('setproctitle')) {
@@ -340,12 +596,13 @@ class Resque_Worker
 	 * QUIT: Shutdown after the current job finishes processing.
 	 * USR1: Kill the forked child immediately and continue processing jobs.
 	 */
-	protected function registerSigHandlers()
+	private function registerSigHandlers()
 	{
 		if(!function_exists('pcntl_signal')) {
 			return;
 		}
 
+		declare(ticks = 1);
 		pcntl_signal(SIGTERM, array($this, 'shutDownNow'));
 		pcntl_signal(SIGINT, array($this, 'shutDownNow'));
 		pcntl_signal(SIGQUIT, array($this, 'shutdown'));

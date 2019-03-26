@@ -53,7 +53,15 @@ class Resque_Log extends Psr\Log\AbstractLogger
 		// build a replacement array with braces around the context keys
 		$replace = array();
 		foreach ($context as $key => $val) {
-			$replace['{' . $key . '}'] = $val;
+			$newvar = clone $val;
+		    if ($newvar->payload['args'][0]['data']) {
+                unset($newvar->payload['args'][0]['data']);
+		    }
+		    if ($newvar->payload['args'][0]['request']) {
+                unset($newvar->payload['args'][0]['request']);
+		    }
+		    
+			$replace['{' . $key . '}'] = $newvar;
 		}
 	
 		// interpolate replacement values into the message and return

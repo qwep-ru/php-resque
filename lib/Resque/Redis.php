@@ -28,6 +28,12 @@ class Resque_Redis
 	 * The default Redis Database number
 	 */
 	const DEFAULT_DATABASE = 0;
+	
+	/**
+	 * Dsn of source servers (master nodes)
+	 * @var string|array
+	 */
+	public $sourceServer = null;
 
 	/**
 	 * @var array List of all commands in Redis that supply a key as their
@@ -98,7 +104,7 @@ class Resque_Redis
 	 */
 	public static function prefix($namespace)
 	{
-	    if (substr($namespace, -1) !== ':' && $namespace != '') {
+	    if (substr($namespace, -1) !== ':') {
 	        $namespace .= ':';
 	    }
 	    self::$defaultNamespace = $namespace;
@@ -108,45 +114,38 @@ class Resque_Redis
 	 * @param string|array $server A DSN or array
 	 * @param int $database A database number to select. However, if we find a valid database number in the DSN the
 	 *                      DSN-supplied value will be used instead and this parameter is ignored.
-	 * @param object $client Optional Credis_Cluster or Credis_Client instance instantiated by you
+	 * @param string|array $sourceServer A DSN or array of other servers (master nodes)
 	 */
-    public function __construct($server, $database = null, $client = null)
+    public function __construct($server, $database = null, $sourceServer = null)
 	{
-		try {
-			if (is_array($server)) {
-				$this->driver = new Credis_Cluster($server);
-			}
-			else if (is_object($client)) {
-				$this->driver = $client;
-			}
-			else {
-				list($host, $port, $dsnDatabase, $user, $password, $options) = self::parseDsn($server);
-				// $user is not used, only $password
+		if (is_array($server)) {
+			$this->driver = new Credis_Cluster($server);
+		}
+		else {
 
-				// Look for known Credis_Client options
-				$timeout = isset($options['timeout']) ? intval($options['timeout']) : null;
-				$persistent = isset($options['persistent']) ? $options['persistent'] : '';
-				$maxRetries = isset($options['max_connect_retries']) ? $options['max_connect_retries'] : 0;
+		    $this->sourceServer = $sourceServer;
+		    
+			list($host, $port, $dsnDatabase, $user, $password, $options) = self::parseDsn($server);
+			// $user is not used, only $password
 
-				$this->driver = new Credis_Client($host, $port, $timeout, $persistent);
-				$this->driver->setMaxConnectRetries($maxRetries);
-				if ($password){
-					$this->driver->auth($password);
-				}
+			// Look for known Credis_Client options
+			$timeout = isset($options['timeout']) ? intval($options['timeout']) : null;
+			$persistent = isset($options['persistent']) ? $options['persistent'] : '';
 
-				// If we have found a database in our DSN, use it instead of the `$database`
-				// value passed into the constructor.
-				if ($dsnDatabase !== false) {
-					$database = $dsnDatabase;
-				}
+			$this->driver = new Credis_Client($host, $port, $timeout, $persistent);
+			if ($password){
+				$this->driver->auth($password);
 			}
 
-			if ($database !== null) {
-				$this->driver->select($database);
+			// If we have found a database in our DSN, use it instead of the `$database`
+			// value passed into the constructor.
+			if ($dsnDatabase !== false) {
+				$database = $dsnDatabase;
 			}
 		}
-		catch(CredisException $e) {
-			throw new Resque_RedisException('Error communicating with Redis: ' . $e->getMessage(), 0, $e);
+
+		if ($database !== null) {
+			$this->driver->select($database);
 		}
 	}
 
@@ -156,7 +155,6 @@ class Resque_Redis
 	 * - host:port
 	 * - redis://user:pass@host:port/db?option1=val1&option2=val2
 	 * - tcp://user:pass@host:port/db?option1=val1&option2=val2
-	 * - unix:///path/to/redis.sock
 	 *
 	 * Note: the 'user' part of the DSN is not used.
 	 *
@@ -169,16 +167,6 @@ class Resque_Redis
 		if ($dsn == '') {
 			// Use a sensible default for an empty DNS string
 			$dsn = 'redis://' . self::DEFAULT_HOST;
-		}
-		if(substr($dsn, 0, 7) === 'unix://') {
-			return array(
-				$dsn,
-				null,
-				false,
-				null,
-				null,
-				null,
-			);
 		}
 		$parts = parse_url($dsn);
 
@@ -249,7 +237,7 @@ class Resque_Redis
 			return $this->driver->__call($name, $args);
 		}
 		catch (CredisException $e) {
-			throw new Resque_RedisException('Error communicating with Redis: ' . $e->getMessage(), 0, $e);
+			return false;
 		}
 	}
 
